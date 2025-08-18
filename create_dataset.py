@@ -30,7 +30,7 @@ def create_dataset_from_video(video_path):
             if results[0].boxes and results[0].boxes.id is not None:
                 # Save frame only when detections exist
                 frame_save_path = raw_image_dir / f"frame_{frame_count:06d}_{Path(video_path).stem}.jpg"
-                label_save_path = label_dir / f"frame_{frame_count:06d}.txt"
+                label_save_path = label_dir / f"frame_{frame_count:06d}_{Path(video_path).stem}.txt"
                 cv2.imwrite(str(frame_save_path), frame)
                 
                 # Get frame dimensions for YOLO normalization
