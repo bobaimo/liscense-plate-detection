@@ -21,17 +21,17 @@ class rtsp_realtime_detection:
             self.easyocr = easyocr_reader()
             self.trocr = trocr_reader()
             self.id_dict_easyocr, self.id_dict_trocr = {}, {}
-            self.id_final_easyocr, self.id_final_trocr = {}, {}
         elif self.type == "china":
             self.LPRNet = LPRNetInference()
-            self.id_dict_net, self.id_final_net = {}, {}
+            self.id_dict_net = {}
+        self.valid_result = {}
         
         self.detector = YOLO("./models/license_plate_11x.pt")
-        self.written_track_ids = set()
-        self.FRAME_THRESHOLD = 15
+        self.confirmed_track_ids = set()
+        self.FRAME_THRESHOLD = 10
         
         # Performance optimization settings
-        self.frame_skip = 2  # Process every nth frame
+        self.frame_skip = 5  # Process every nth frame
         self.frame_count = 0
         self.fps_counter = 0
         self.fps_start_time = time.time()
@@ -40,20 +40,32 @@ class rtsp_realtime_detection:
         self.ocr_queue = Queue(maxsize=10)
         self.ocr_results = {}
         self.ocr_thread_running = True
-        if self.type == "hongkong":
-            self.ocr_thread = threading.Thread(target=self._ocr_worker, daemon=True)
-            self.ocr_thread.start()
+        self.ocr_thread = threading.Thread(target=self._ocr_worker, daemon=True)
+        self.ocr_thread.start()
+        
+        # Threading for result processing
+        self.result_queue = Queue(maxsize=20)
+        self.result_thread_running = True
+        self.result_thread = threading.Thread(target=self._ocr_result_worker, daemon=True)
+        self.result_thread.start()
+
+        # Detection counter
+        self.current_detections = 0
 
         # Create output directory based on RTSP URL
         stream_name = self.rtsp_url.replace("://", "_").replace("/", "_").replace(":", "_")
         self.output_dir = Path("cropped_box") / f"rtsp_stream_{stream_name}_{int(time.time())}"
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
-        # Initialize RTSP stream
-        self.video_cap = cv2.VideoCapture(rtsp_url)
-        # Optimize buffer settings for low latency
+        # Initialize RTSP stream with timeout settings
+        self.video_cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+        
+        # Optimize buffer settings for low latency and set timeout
         self.video_cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         self.video_cap.set(cv2.CAP_PROP_FPS, 15)  # Limit FPS
+        # Set RTSP timeout to 60 seconds (in milliseconds)
+        self.video_cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 60000)
+        self.video_cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 60000)
         # Additional optimizations
         self.video_cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         self.video_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
@@ -80,27 +92,92 @@ class rtsp_realtime_detection:
                 if not self.ocr_queue.empty():
                     task = self.ocr_queue.get(timeout=0.1)
                     if task is None:  # Shutdown signal
+                        self.result_queue.put(None)
+                        self.ocr_thread_running=False
                         break
                     
-                    track_id, frame_crop, timestamp, x1, y1, x2, y2 = task
-                    
-                    # Process with EasyOCR
-                    license_num_easy, _ = self.easyocr.read_plate(frame_crop, [])
-                    license_num_easy = license_num_easy.upper().replace('I', '1').replace('O', '0').replace('Q', '0')
-                    
-                    # Process with TrOCR
-                    license_num_trocr, _ = self.trocr.read_plate(frame_crop, [])
-                    license_num_trocr = license_num_trocr.upper().replace('I', '1').replace('O', '0').replace('Q', '0')
-                    
-                    # Store results
-                    self.ocr_results[track_id] = {
-                        'easyocr': license_num_easy,
-                        'trocr': license_num_trocr,
-                        'timestamp': timestamp,
-                        'bbox': (x1, y1, x2, y2)
-                    }
-                    
+                    track_id, frame_crop,frame = task
+
+                    match self.type:
+                        case "hongkong":
+                            license_num_easy, bbox_plate = self.easyocr.read_plate(frame_crop)
+                            license_num_easy = license_num_easy.upper().replace('I', '1').replace('O', '0').replace('Q', '0')
+
+                            # Process with TrOCR
+                            license_num_trocr, _ = self.trocr.read_plate(frame_crop, bbox_plate)
+                            license_num_trocr = license_num_trocr.upper().replace('I', '1').replace('O', '0').replace('Q', '0')
+
+                            # Store results
+                            self.result_queue.put((track_id, license_num_easy, license_num_trocr, frame))
+
+                        case "china":
+                            pass
+
+                        case _:
+                            print("region not specified")
+                        
+
                     self.ocr_queue.task_done()
+                else:
+                    time.sleep(0.01)
+            except Exception as e:
+                print(f"OCR worker error: {e}")
+                continue
+
+    def _ocr_result_worker(self):
+        while self.result_thread_running:
+            try:
+                if not self.result_queue.empty():
+                    result = self.result_queue.get(timeout=0.1)
+                    if result is None:  # Shutdown signal
+                        self.result_thread_running=False
+                        break
+                    track_id, license_num_easy,license_num_trocr,frame = result
+
+                    match self.type:
+                        case "hongkong":
+                            if track_id not in self.confirmed_track_ids:
+                                # Initialize valid_result for this track_id if not exists
+                                if track_id not in self.valid_result:
+                                    self.valid_result[track_id] = {"easyocr": None, "trocr": None}
+
+                                if license_num_easy != "":
+                                    if track_id not in self.id_dict_easyocr:
+                                        self.id_dict_easyocr[track_id] = {}
+                                    if license_num_easy not in self.id_dict_easyocr[track_id]:
+                                        self.id_dict_easyocr[track_id][license_num_easy] = 0
+                                    self.id_dict_easyocr[track_id][license_num_easy] += 1
+                                    if self.id_dict_easyocr[track_id][license_num_easy] > self.FRAME_THRESHOLD:
+                                        self.valid_result[track_id]["easyocr"] = license_num_easy
+                                        save_path = self.out_dir/f"{str(self.easyocr)}_{track_id}_put{license_num_easy}.jpg"
+                                        cv2.imwrite(str(save_path), frame, [cv2.IMWRITE_JPEG_QUALITY, 100])
+                                        print(f"easyocr detection successful with number{license_num_easy}")
+                                
+                                if license_num_trocr != "":
+                                    if track_id not in self.id_dict_trocr:
+                                        self.id_dict_trocr[track_id] = {}
+                                    if license_num_trocr not in self.id_dict_trocr[track_id]:
+                                        self.id_dict_trocr[track_id][license_num_trocr] = 0
+                                    self.id_dict_trocr[track_id][license_num_trocr] += 1
+                                    if self.id_dict_trocr[track_id][license_num_trocr] > self.FRAME_THRESHOLD:
+                                        self.valid_result[track_id]["trocr"] = license_num_trocr
+                                        save_path = self.output_dir/f"{str(self.trocr)}_{track_id}_{license_num_trocr}.jpg"
+                                        cv2.imwrite(str(save_path), frame, [cv2.IMWRITE_JPEG_QUALITY, 100])
+                                        print(f"trocr detection successful with number{license_num_trocr}")
+                                
+                                # Check if both OCR methods agree
+                                if (self.valid_result[track_id]["easyocr"] is not None and 
+                                    self.valid_result[track_id]["trocr"] is not None and
+                                    self.valid_result[track_id]["easyocr"] == self.valid_result[track_id]["trocr"]):
+                                    self.confirmed_track_ids.add(track_id)
+                                    # Write to CSV
+                        case "china":
+                            pass
+
+                        case _:
+                            print("region not specified")
+
+                    self.result_queue.task_done()
                 else:
                     time.sleep(0.01)
             except Exception as e:
@@ -109,107 +186,71 @@ class rtsp_realtime_detection:
 
     def detection(self, frame):
         self.frame_count += 1
-        self.fps_counter += 1
-        
-        # Skip frames for performance
-        if self.frame_count % self.frame_skip != 0:
-            # Still process OCR results and display existing detections
-            if self.type == "hongkong":
-                self._process_ocr_results(frame)
-            # Show FPS
-            self._display_fps(frame)
-            cv2.imshow("RTSP License Detection", frame)
-            return frame
-        
-        current_time = time.time()
-        results = self.detector.track(frame, persist=True, conf=0.6)
-        
+        results = self.detector.track(frame, persist=True, conf=0.6, verbose=False)     
         if results[0].boxes and results[0].boxes.id is not None:
             xyxys = results[0].boxes.xyxy.cpu().numpy()
             track_ids = results[0].boxes.id.cpu().numpy().astype(int)
             
+            # Count current detections
+            self.current_detections = len(track_ids)
+            
             for xyxy, track_id in zip(xyxys, track_ids):
-                if track_id == np.int64(9):
-                    continue
-                    
                 x1, y1, x2, y2 = map(int, xyxy)
                 
-                if self.type == "hongkong":
-                    # Queue for async OCR processing if not already processed
-                    if track_id not in self.id_final_easyocr and track_id not in self.ocr_results:
-                        if not self.ocr_queue.full():
-                            license_image = frame[y1:y2, x1:x2].copy()
-                            self.ocr_queue.put((track_id, license_image, current_time, x1, y1, x2, y2))
+                # Process OCR on every nth frame for performance
+                if self.frame_count % self.frame_skip == 0:
+                    match self.type:
+                        case "hongkong":
+                            if track_id not in self.confirmed_track_ids:
+                                if not self.ocr_queue.full():
+                                    license_image = frame[y1:y2, x1:x2].copy()
+                                    self.ocr_queue.put((track_id, license_image, frame.copy()))
+
+                        case "china":
+                            frame = self.reader_logging_net(track_id, frame, x1, y1, x2, y2, time.time())
+
+                        case _:
+                            print("no region specified")
+       
+                # Always display bounding boxes and license plates on every frame
+                if track_id in self.confirmed_track_ids:
+                    frame = self.visualization(frame, self.valid_result[track_id]["easyocr"], x1, y1, x2, y2)
+                else:
+                    # Show bounding box without text if not yet detected
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
                     
-                    # Check for completed OCR results
-                    if track_id in self.ocr_results:
-                        self._handle_ocr_result(track_id, frame, current_time)
-                    
-                    # Display if finalized
-                    if track_id in self.id_final_easyocr:
-                        frame = self.visualization(frame, self.id_final_easyocr[track_id], x1, y1, x2, y2)
-                        
-                elif self.type == "china":
-                    frame = self.reader_logging_net(track_id, frame, x1, y1, x2, y2, current_time)
-        
-        # Show FPS
-        self._display_fps(frame)
+        # Show FPS and detection count
+        frame = self._display_info(frame)
         # Display realtime output
         cv2.imshow("RTSP License Detection", frame)
         return frame
     
-    def _process_ocr_results(self, frame):
-        """Process completed OCR results on skipped frames"""
-        for track_id in list(self.ocr_results.keys()):
-            if track_id not in self.id_final_easyocr:
-                self._handle_ocr_result(track_id, frame, time.time())
-    
-    def _handle_ocr_result(self, track_id, frame, current_time):
-        """Handle completed OCR results"""
-        result = self.ocr_results[track_id]
-        license_easy = result['easyocr']
-        license_trocr = result['trocr']
+    def _display_info(self, frame):        
+        # Display detection count in top right corner
+        frame_width = frame.shape[1]
+        detection_text = f"Detections: {self.current_detections}"
+        text_size = cv2.getTextSize(detection_text, cv2.FONT_HERSHEY_SIMPLEX, 1, 2)[0]
+        cv2.putText(frame, detection_text, (frame_width - text_size[0] - 10, 30), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
         
-        if license_easy and license_easy != "":
-            if track_id not in self.id_dict_easyocr:
-                self.id_dict_easyocr[track_id] = {}
-            if license_easy not in self.id_dict_easyocr[track_id]:
-                self.id_dict_easyocr[track_id][license_easy] = 0
-            self.id_dict_easyocr[track_id][license_easy] += 1
-            if self.id_dict_easyocr[track_id][license_easy] > self.FRAME_THRESHOLD:
-                self.id_final_easyocr[track_id] = license_easy
+        # Resize frame for display (scale down large frames)
+        max_display_width = 1280
+        max_display_height = 720
+        height, width = frame.shape[:2]
         
-        if license_trocr and license_trocr != "":
-            if track_id not in self.id_dict_trocr:
-                self.id_dict_trocr[track_id] = {}
-            if license_trocr not in self.id_dict_trocr[track_id]:
-                self.id_dict_trocr[track_id][license_trocr] = 0
-            self.id_dict_trocr[track_id][license_trocr] += 1
-            if self.id_dict_trocr[track_id][license_trocr] > self.FRAME_THRESHOLD:
-                self.id_final_trocr[track_id] = license_trocr
+        # Calculate scaling factor
+        scale_width = max_display_width / width
+        scale_height = max_display_height / height
+        scale = min(scale_width, scale_height, 1.0)  # Don't scale up
         
-        # Save image and write to CSV when both are finalized
-        if (track_id in self.id_final_easyocr and track_id in self.id_final_trocr and 
-            track_id not in self.written_track_ids):
-            self.csv_writer.writerow([track_id, f"{self.output_dir}/easyocr_{track_id}_{self.id_final_easyocr[track_id]}_{int(current_time)}.jpg",
-                                    self.id_final_easyocr[track_id], self.id_final_trocr[track_id], current_time])
-            self.written_track_ids.add(track_id)
-        
-        # Clean up processed results
-        del self.ocr_results[track_id]
-    
-    def _display_fps(self, frame):
-        """Display FPS counter on frame"""
-        current_time = time.time()
-        if current_time - self.fps_start_time >= 1.0:
-            fps = self.fps_counter / (current_time - self.fps_start_time)
-            self.fps_counter = 0
-            self.fps_start_time = current_time
-            self.current_fps = fps
-        
-        if hasattr(self, 'current_fps'):
-            cv2.putText(frame, f"FPS: {self.current_fps:.1f}", (10, 30), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        if scale < 1.0:
+            new_width = int(width * scale)
+            new_height = int(height * scale)
+            resized_frame = cv2.resize(frame, (new_width, new_height))
+        else:
+            resized_frame = frame
+            
+        return resized_frame
 
     def visualization(self, frame, label, x1, y1, x2, y2):
         if self.type == "china":
@@ -282,6 +323,26 @@ class rtsp_realtime_detection:
         else:
             frame = self.visualization(frame, self.id_final_net[track_id], x1, y1, x2, y2)
         return frame
+    
+
+    def write_csv(self):
+        """Write all confirmed detections to CSV file"""
+        for track_id in self.confirmed_track_ids:
+            if track_id in self.valid_result:
+                easyocr_result = self.valid_result[track_id].get("easyocr", "")
+                trocr_result = self.valid_result[track_id].get("trocr", "")
+                timestamp = time.time()
+                
+                # Write to CSV
+                self.csv_writer.writerow([
+                    track_id,
+                    f"{self.output_dir}/confirmed_{track_id}_{easyocr_result}.jpg",
+                    easyocr_result,
+                    trocr_result,
+                    timestamp
+                ])
+        
+        self.csv_file.flush()
 
     def main(self):
         print(f"Starting RTSP stream processing: {self.rtsp_url}")
@@ -297,12 +358,14 @@ class rtsp_realtime_detection:
                         break
                 else:
                     print("Failed to read frame from RTSP stream")
-                    # Try to reconnect
+                    # Try to reconnect with proper settings
                     self.video_cap.release()
                     time.sleep(1)
-                    self.video_cap = cv2.VideoCapture(self.rtsp_url)
+                    self.video_cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
                     self.video_cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                     self.video_cap.set(cv2.CAP_PROP_FPS, 15)
+                    self.video_cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 60000)
+                    self.video_cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 60000)
                     self.video_cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
                     self.video_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
                     if not self.video_cap.isOpened():
@@ -312,12 +375,10 @@ class rtsp_realtime_detection:
             print("\nStopping RTSP stream processing...")
         finally:
             # Cleanup
-            if hasattr(self, 'ocr_thread_running'):
-                self.ocr_thread_running = False
-                self.ocr_queue.put(None)  # Signal thread to stop
-                if hasattr(self, 'ocr_thread'):
-                    self.ocr_thread.join(timeout=2)
-            
+            self.ocr_queue.put(None)
+            while self.result_thread_running is not False:
+                time.sleep(0.1)
+            self.write_csv()
             self.video_cap.release()
             self.csv_file.close()
             cv2.destroyAllWindows()
@@ -325,7 +386,7 @@ class rtsp_realtime_detection:
 
 
 if __name__ == "__main__":
-    rtsp_url="rtsp://admin:rsxx1111@192.168.10.28/1"
+    rtsp_url="rtsp://admin:rsxx1111@192.168.10.175/stream1"
     # rtsp_url="rtsp://localhost:8554/"
     try:
         # Choose license type: "hongkong" or "china"

@@ -16,20 +16,22 @@ class realtime_detection:
         if self.type=="hongkong":
             self.easyocr=easyocr_reader()
             self.trocr=trocr_reader()
-            self.id_dict_easyocr,self.id_dict_trocr={},{}
-            self.id_final_easyocr,self.id_final_trocr={},{}
+            self.id_dict_easyocr={}
+            self.id_dict_trocr={}
         elif self.type=="china":
             self.LPRNet=LPRNetInference()
-            self.id_dict_net,self.id_final_net={},{}
+            self.id_dict_net={}
+        self.valid_result={}
+        
         self.detector=YOLO("./models/license_plate_11x.pt")
-        self.written_track_ids=set()
+        self.confirmed_track_ids=set()
         self.FRAME_THRESHOLD = 15
 
         self.output_dir=Path("cropped_box") / Path(video_path).stem
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.video_cap=cv2.VideoCapture(video_path)
 
-        self.output_init()
+        self.output_init(video_path)
         self.csv_init(video_path)
 
         
@@ -45,7 +47,7 @@ class realtime_detection:
             self.csv_writer.writerow(['Track_ID', 'Image_Path', 'License_Number'])
 
 
-    def output_init(self):
+    def output_init(self,video_path):
         fps = 30  # Set output video to 30 fps
         width = int(self.video_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(self.video_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -60,17 +62,20 @@ class realtime_detection:
             xyxys = results[0].boxes.xyxy.cpu().numpy()
             track_ids = results[0].boxes.id.cpu().numpy().astype(int)
             for xyxy, track_id in zip(xyxys, track_ids):
-                if track_id==np.int64(9):
-                    pass
                 x1, y1, x2, y2 = map(int, xyxy)
-                if self.type=="hongkong":
-                    bbox_list=self.reader_logging_ocr(self.easyocr,track_id,frame,x1, y1, x2, y2, bbox_list)
-                    self.reader_logging_ocr(self.trocr,track_id,frame,x1, y1, x2, y2, bbox_list)
-                    if self.check_license_num_identical(track_id):
-                        frame=self.visualization(frame,self.id_final_easyocr[track_id],x1, y1, x2, y2)
-                elif self.type=="china":
-                    x1, y1, x2, y2 = map(int, xyxy)
-                    frame=self.reader_logging_net(track_id,frame,x1, y1, x2, y2)    
+                if track_id not in self.confirmed_track_ids:    
+                    if self.type=="hongkong":
+                        crop_frame=frame[y1:y2,x1:x2]
+                        license_num_easy,bbox_plate=self.easyocr.read_plate(crop_frame)
+                        license_num_trocr=self.trocr.read_plate(crop_frame,bbox_plate)
+                        self.reader_logging_ocr(track_id,[license_num_easy,license_num_trocr],frame.copy())
+                        if track_id in self.confirmed_track_ids:
+                            frame=self.visualization(frame,self.valid_result[track_id]["easyocr"],x1, y1, x2, y2)
+                        else:
+                            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    elif self.type=="china":
+                        x1, y1, x2, y2 = map(int, xyxy)
+                        frame=self.reader_logging_net(track_id,frame,x1, y1, x2, y2)    
         self.out.write(frame)
         
         # Resize frame to fit monitor
@@ -143,71 +148,26 @@ class realtime_detection:
             cv2.putText(frame, label, (x1+5, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 2.0, (255, 255, 255), 3)
             return frame
 
-    def is_blurry(self, image, threshold=130):
-        """Check if image is blurry using Laplacian variance"""
-        if image.size == 0:
-            return True
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
-        laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
-        is_blur = laplacian_var < threshold
-        
-        # Debug: show blurry images
-        if is_blur:
-            # Resize for better visibility
-            h, w = image.shape[:2]
-            if h < 100 or w < 200:
-                scale = max(100/h, 200/w)
-                new_h, new_w = int(h*scale), int(w*scale)
-                debug_image = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
-            else:
-                debug_image = image.copy()
-            
-            # Add text overlay with blur score
-            cv2.putText(debug_image, f"BLURRY: {laplacian_var:.1f}", (10, 30), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-            cv2.imshow("Blurry License Plate", debug_image)
-            cv2.waitKey(1)
-            
-        return is_blur
+    def reader_logging_ocr(self,track_id,license_list,frame):
+        for license, id_dict, reader in zip(license_list,[self.id_dict_easyocr,self.id_dict_trocr],[self.easyocr,self.trocr]):
+            if license != "":
+                license = str(license).upper().replace('I', '1').replace('O', '0').replace('Q', '0')
+                if track_id not in id_dict:
+                    id_dict[track_id]={}
+                if license not in id_dict[track_id]:
+                    id_dict[track_id][license]=0
+                id_dict[track_id][license]+=1
+                if id_dict[track_id][license]> self.FRAME_THRESHOLD:
+                    if track_id not in self.valid_result:
+                        self.valid_result[track_id] = {"easyocr": None, "trocr": None}
+                    self.valid_result[track_id][str(reader)]=license
+                    save_path=self.output_dir/Path(str(reader))/f"{track_id}_{license}.jpg"
+                    save_path.mkdir(parents=True, exist_ok=True)
+                    cv2.imwrite(f"{str(save_path)}/{track_id}_{license}.jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 100])
+                    print(f"{str(reader)} detection successful with number{license}")
+                    if self.valid_result[track_id]["easyocr"] == self.valid_result[track_id]["trocr"]:
+                        self.confirmed_track_ids.add(track_id)
 
-    def reader_logging_ocr(self,reader,track_id,frame,x1,y1,x2,y2,bbox_list):
-        if reader is self.easyocr:
-            id_dict=self.id_dict_easyocr
-            id_final=self.id_final_easyocr
-        else:
-            id_dict=self.id_dict_trocr
-            id_final=self.id_final_trocr
-        if track_id not in id_final:
-            license_image=frame[y1:y2,x1:x2]
-            # if self.is_blurry(license_image):
-            #     return [] if str(reader)=="easyocr" else None
-            license_num,bbox_list=reader.read_plate(license_image,bbox_list)
-            license_num=license_num.upper()
-            license_num = license_num.replace('I', '1').replace('O', '0').replace('Q', '0')
-            if license_num=="": 
-                return []
-            if track_id not in id_dict:
-                id_dict[track_id] = {}
-            if license_num not in id_dict[track_id]:
-                id_dict[track_id][license_num]=0
-            id_dict[track_id][license_num] += 1
-            if id_dict[track_id][license_num]>self.FRAME_THRESHOLD:
-                id_final[track_id]=license_num
-                save_path = self.output_dir/f"{str(reader)}_{track_id}_{license_num}.jpg"
-                cv2.imwrite(str(save_path), frame, [cv2.IMWRITE_JPEG_QUALITY, 100])
-        if str(reader)=="easyocr":
-            return bbox_list
-
-    def check_license_num_identical(self,track_id):
-        if track_id in self.id_final_easyocr and track_id in self.id_final_trocr:
-            if track_id not in self.written_track_ids:
-                self.csv_writer.writerow([track_id,f"{self.output_dir}/{str(self.easyocr)}_{track_id}_{self.id_final_easyocr[track_id]}.jpg",
-                                        self.id_final_easyocr[track_id], self.id_final_trocr[track_id]])
-                self.written_track_ids.add(track_id)
-            return self.id_final_trocr[track_id]==self.id_final_easyocr[track_id]
-        else:
-            return False
-        
     def reader_logging_net(self,track_id,frame,x1,y1,x2,y2):
         if track_id not in self.id_final_net:
             license_image=frame[y1:y2,x1:x2]
@@ -229,6 +189,22 @@ class realtime_detection:
             frame=self.visualization(frame,self.id_final_net[track_id],x1, y1, x2, y2)
         return frame
 
+    def write_csv(self):
+        for track_id in self.valid_result:
+            easyocr_result = self.valid_result[track_id].get("easyocr", "")
+            trocr_result = self.valid_result[track_id].get("trocr", "")
+            if track_id in self.confirmed_track_ids or easyocr_result is not None:
+                save_dir=f"{self.output_dir}/easyocr/{track_id}_{easyocr_result}.jpg"
+            else:
+                save_dir=f"{self.output_dir}/trocr/{track_id}_{trocr_result}.jpg"
+
+            # Write to CSV
+            self.csv_writer.writerow([
+                track_id,
+                save_dir,
+                easyocr_result,
+                trocr_result
+            ])
 
     def main(self):
         while self.video_cap.isOpened():
@@ -237,11 +213,13 @@ class realtime_detection:
                 self.detection(frame)
             else:
                 break
+
+        self.writecsv()
         self.out.release()
         self.video_cap.release()
         self.csv_file.close()  # Close CSV file
         cv2.destroyAllWindows()
-        print(f"Video saved to {self.output_video_path}")
+        print(f"Video saved to {self.output_video_pavideo_pathth}")
         print(f"License detections saved to {self.csv_file_path}")
 
 

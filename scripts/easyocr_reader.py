@@ -28,15 +28,15 @@ class easyocr_reader:
         cv2.imshow("",image)
         cv2.waitKey(2000)
 
-    def read_plate(self,image,bbox_list):
+    def read_plate(self,image,bbox_list=[]):
         processed_image=self.image_processing(image)
         result=self.reader.readtext(processed_image)
         text_list=[]
         for i in range (len(result)):
-            bbox_list.append(result[i][0])
+            bbox_corner=result[i][0]
+            bbox_list.append(self.corner_to_xyxy(bbox_corner))
             text_list.append(result[i][1])
         license_num="".join(text_list).replace(" ", "")
-        # license_num = "".join(self.reader.readtext(image,detail=0)).replace(" ", "")
         return license_num,bbox_list
     
     def get_size(self,image):
@@ -47,17 +47,20 @@ class easyocr_reader:
         else:
             scale_factor = 450/width
         return int(scale_factor*width), int(scale_factor*height)
+    
+    def corner_to_xyxy(self,bbox):
+        x1=int(bbox[0][0])
+        x2=int(bbox[1][0])
+        y1=int(bbox[0][1])
+        y2=int(bbox[2][1])
+        return x1,x2,y1,y2
            
 if __name__=="__main__":
     r=easyocr_reader()
-    # for i in range (900,946,15):
-    #     image= Image.open("dataset/carpark_1/bounding_box/frame_000"+str(i)+"_1.jpg")
-    #     # r.image_visualization(r.image_processing(image))
-    #     print(r.read_plate(image))
     for directory in ["","_original"]:
         print(f"directory:{directory}")
         for i in range (1305,1321,15):
             image= cv2.imread(f"dataset/carpark_1{directory}/bounding_box/frame_00{i}_1.jpg")
-            license_num,bbox=r.read_plate(image,[])
+            license_num,bbox=r.read_plate(image)
             print(license_num,bbox)
 
