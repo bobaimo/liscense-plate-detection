@@ -6,4 +6,5 @@ videos
 .vscode
 sample
 dataset
+people_counter
 __pycache__
